@@ -1,0 +1,407 @@
+---
+title: "TIP-RA QC & Clustering"
+author: "Virginia Muir, Kaitlin Flynn, Matt Dufort"
+date: "2023-05-10"
+output: html_document
+---
+# Analysis Summary
+
+TIP-RA collects RA subject CD4 T cells via flow cytometry.  The goal of this analysis is likely to characterize Tmr+ cells for 5 sets of antigen-specific cells: flu, aggrecan, cilp, enolase, and vimentin/fibrinogen.  The data contain subjects at varying stages of disease, and most or all have at least one HLA-DRB1*0401 allele.
+
+## Prepare R environment 
+
+```{r setup, include=FALSE}
+# Session options
+options(stringsAsFactors = FALSE)
+set.seed(12345)
+
+library(knitr)
+opts_chunk$set(echo = F, message = F, warning = F, cache = T)
+
+# Set up the environment with required packages, installing as needed
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(flowCore)) BiocManager::install("flowCore"); library(flowCore)
+if (!require(flowStats)) BiocManager::install("flowStats"); library(flowStats)
+if (!require(cytofkit)) {if(!require(remotes)) install.packages("remotes"); remotes::install_github("JinmiaoChenLab/cytofkit")}; library(cytofkit)
+if (!require(Rphenograph)) {if(!require(remotes)) install.packages("remotes"); remotes::install_github("JinmiaoChenLab/Rphenograph")}; library(Rphenograph)
+if (!require(igraph)) install.packages("igraph"); library(igraph)
+if (!require(ggthemes)) install.packages("ggthemes"); library(ggthemes)
+if (!require(gridExtra)) install.packages("gridExtra"); library(gridExtra)
+if (!require(readxl)) install.packages("readxl"); library(readxl)
+if (!require(survival)) install.packages("survival"); library(survival)
+if (!require(reshape2)) install.packages("reshape2"); library(reshape2)
+if (!require(tidyverse)) install.packages("tidyverse"); library(tidyverse)
+if (!require(miscHelpers)) {if(!require(remotes)) install.packages("remotes"); remotes::install_github("BenaroyaResearch/miscHelpers")}; library(miscHelpers)
+
+# Set up the ggplot default params
+theme_set(
+  theme_bw(12) + 
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          plot.title = element_text(size=15, face="bold", margin = margin(10,0,10,0)),
+          axis.text.x = element_text(angle=45, hjust = 1)))
+```
+
+```{r set_working_directory, cache=FALSE}
+# Set working directory 
+## (This isn't strictly required, since Rmarkdown will use whatever folder this script is stored in as the working directory, but I find it useful for troubleshooting in the console.)
+## A windows version would look like:
+## setwd("~\Grandparent folder\Parent folder\Folder where this script and your data folders are")
+dir_root <-
+  file.path("~", "Library", "CloudStorage", "Box-Box", "Projects",
+            "TIP_RA_cross_sectional_simplified")
+setwd(dir_root)
+opts_knit$set(root.dir = dir_root)
+```
+
+```{r set_directories_and_global_variables}
+dir_data <- "data"
+
+# set up colorblind palette
+cb_pal <- colorblind_pal()(8)[-1] 
+
+# Create vector of markers that will be used for all downstream clustering
+assay_markers = c("CD4", "CD45RA", "CD38", "CCR4", "CCR6", "CCR7", "CXCR3")
+clustering_markers <- c("CD45RA", "CD38", "CCR4", "CCR6", "CCR7", "CXCR3")
+
+# Generate file structure in which to save R data and exports
+path_stem <- file.path(dir_root, "output")
+dir.create(path_stem)
+dir_R_objects <- file.path(path_stem, "R_objects"); dir.create(dir_R_objects)
+dir_analysis_plots <- file.path(path_stem, "analysis_plots"); dir.create(dir_analysis_plots)
+dir_QA_plots <- file.path(path_stem, "QA_plots"); dir.create(dir_QA_plots)
+dir_density_plots <- file.path(dir_QA_plots, "density_plots"); dir.create(dir_density_plots)
+```
+
+
+## Load & transform data
+Pull in the flow data (with dump gates removed), including sample/subject associations.
+
+The flow data are brought in as FCS files containing MFI values. We transform MFIs using a hyperbolic arcsin transformation with b = 1/150.
+
+```{r import_and_format_data, include=F}
+## There are a couple of ways you can import your data, depending on which data you'd like to pull in.
+
+# set data folder name
+dir_data_fcs <- file.path(dir_data, "V1_FCS")
+
+# List all files in the data folder
+fcs_files_all <- list.files(dir_data_fcs, full.names = T, recursive = T)
+
+# List all files that end in .fcs anywhere in your working directory & its sub-directories
+# fcs_files_all <- list.files(pattern = ".fcs", full.names = T, recursive = T)
+
+#Subset to total CD4 files
+files_fcs_cd4_pre <- fcs_files_all[str_detect(fcs_files_all, regex("Pre[_-]Tube", ignore_case = T))]
+
+#Subset to tmr+ files
+files_fcs_flu_tmr <- fcs_files_all[str_detect(fcs_files_all, "Flu")]
+files_fcs_agg_tmr <- fcs_files_all[str_detect(fcs_files_all, "Agg")]
+files_fcs_cilp_tmr <- fcs_files_all[str_detect(fcs_files_all, "CILP")]
+files_fcs_eno_tmr <- fcs_files_all[str_detect(fcs_files_all, "Eno")]
+files_fcs_vf_tmr <- fcs_files_all[str_detect(fcs_files_all, "VF")]
+
+# Load initial data for ID conversion
+tipra_sample_info =
+  read_xlsx(file.path(dir_data, "TIP_RA_sample_info.xlsx"), 
+            sheet = "samples")
+
+build_fcsList <- function(file_list, phenotypes) {
+  tmp_list <- list()
+  for (fcs in file_list) {
+    tube_id <- fcs %>%
+      str_extract("Tube_[0-9]{3}") %>%
+      str_remove("Tube_")
+    if(str_detect(fcs, "TIP-RA")){
+      fcs_name <- phenotypes %>%
+        dplyr::filter(`FCS ID` == "N/A", `Tube ID` == tube_id) %>%
+        .$Labid %>%
+        str_remove_all("[[:punct:]]") %>%
+        paste0("lab", .)
+    } else {
+      fcs_name <- phenotypes %>%
+        dplyr::filter(`FCS ID` != "N/A", `Tube ID` == tube_id) %>%
+        .$Labid %>%
+        str_remove_all("[[:punct:]]") %>%
+        paste0("lab", .)
+    }
+    tmp_list[[fcs_name]] <- read.FCS(fcs, transformation = F)
+  }
+  return(tmp_list)
+}
+
+# Bring in FCS data
+files_fcs_cd4_pre <- build_fcsList(files_fcs_cd4_pre, tipra_sample_info)
+files_fcs_flu_tmr <- build_fcsList(files_fcs_flu_tmr, tipra_sample_info)
+files_fcs_agg_tmr <- build_fcsList(files_fcs_agg_tmr, tipra_sample_info)
+files_fcs_cilp_tmr <- build_fcsList(files_fcs_cilp_tmr, tipra_sample_info)
+files_fcs_eno_tmr <- build_fcsList(files_fcs_eno_tmr, tipra_sample_info)
+files_fcs_vf_tmr <- build_fcsList(files_fcs_vf_tmr, tipra_sample_info)
+
+# Process data to make labels R-friendly & to specify markers of interest
+key = read.csv(file.path(dir_data, "MarkerKey.csv"), header = T)
+
+process_data <- function(fcs){
+  # Tidy marker names 
+  marker_key <- pData(parameters(fcs))
+  pData(parameters(fcs))$desc <- key$desc[match(marker_key$name, key$name)] %>%
+    toupper()
+
+  # This changes parameters(fcs)$name, featureNames(fcs), and colnames(fcs) - aka column names for the events matrix of the fcs - all in one fell swoop.
+  colnames(fcs) = pData(parameters(fcs))$desc
+  
+  # Preserve only the markers that will be useful for clustering - in a shared order across fcs files
+  fcs = fcs[, assay_markers]
+  
+  # Remove boundary events (those outside of FCS's range)
+  if(nrow(exprs(fcs)) > 1){
+    fcs = 
+      flowCore::Subset(
+        fcs, 
+        flowCore::filter(
+          fcs, 
+          boundaryFilter(x = assay_markers, 
+                         tolerance = 0, 
+                         side = "both")))
+    }
+
+}
+
+# clean up data
+files_fcs_cd4_pre <- map(files_fcs_cd4_pre, process_data)
+files_fcs_flu_tmr <- map(files_fcs_flu_tmr, process_data)
+files_fcs_agg_tmr <- map(files_fcs_agg_tmr, process_data)
+files_fcs_cilp_tmr <- map(files_fcs_cilp_tmr, process_data)
+files_fcs_eno_tmr <- map(files_fcs_eno_tmr, process_data)
+files_fcs_vf_tmr <- map(files_fcs_vf_tmr, process_data)
+```
+
+
+```{r merge_and_transform_data, include=F}
+# Merge total and tmr+ expression data
+all_merged = files_fcs_cd4_pre
+for(subj in names(files_fcs_cd4_pre)){
+  exprs(all_merged[[subj]]) = 
+    rbind(exprs(files_fcs_cd4_pre[[subj]]), 
+          if(is.null(files_fcs_flu_tmr[[subj]]) == F) exprs(files_fcs_flu_tmr[[subj]]),
+          if(is.null(files_fcs_agg_tmr[[subj]]) == F) flowCore::exprs(files_fcs_agg_tmr[[subj]]),
+          if(is.null(files_fcs_cilp_tmr[[subj]]) == F) flowCore::exprs(files_fcs_cilp_tmr[[subj]]),
+          if(is.null(files_fcs_eno_tmr[[subj]]) == F) flowCore::exprs(files_fcs_eno_tmr[[subj]]),
+          if(is.null(files_fcs_vf_tmr[[subj]]) == F) flowCore::exprs(files_fcs_vf_tmr[[subj]]))
+}
+
+# Transform the data
+asinh_tfm_data <- function(fcs){
+  # Arcsinh transform remaining columns
+  tl <- transformList(colnames(fcs), arcsinhTransform(a=0, b=1/150), transformationId="asinh")
+  fcs = transform(fcs, tl) 
+}
+
+all_tfm <- map(all_merged, asinh_tfm_data)
+fcsNames = names(all_tfm)
+
+tfm_fs <- as(all_tfm, "flowSet")
+
+
+# Extract expression data and label Tmr+ events
+mergedExpr = 
+  setNames(data.frame(matrix(ncol = ncol(flowCore::exprs(tfm_fs[[1]]))+2, nrow = 0)),
+           c(colnames(tfm_fs), "sample", "tmr_pos"))
+
+for (name in fcsNames) {
+  tmp.expr = as.data.frame(exprs(tfm_fs[[name]]))[, assay_markers]
+  tmp.expr$sample = as.character(name)
+  tmp.expr$tmr_pos = 
+    c(rep("none", nrow(exprs(files_fcs_cd4_pre[[name]]))), 
+      if(is.null(files_fcs_flu_tmr[[name]]) == F) rep("flu", nrow(exprs(files_fcs_flu_tmr[[name]]))),
+      if(is.null(files_fcs_agg_tmr[[name]]) == F) rep("agg", nrow(exprs(files_fcs_agg_tmr[[name]]))),
+      if(is.null(files_fcs_cilp_tmr[[name]]) == F) rep("cilp", nrow(exprs(files_fcs_cilp_tmr[[name]]))),
+      if(is.null(files_fcs_eno_tmr[[name]]) == F) rep("eno", nrow(exprs(files_fcs_eno_tmr[[name]]))),
+      if(is.null(files_fcs_vf_tmr[[name]]) == F) rep("vf", nrow(exprs(files_fcs_vf_tmr[[name]]))))
+  mergedExpr = rbind(mergedExpr, tmp.expr)
+}
+
+
+# test size of cohorts once removing, regating
+RA_tmrs <- c("agg", "cilp", "eno", "vf")
+
+test_size <- mergedExpr %>% dplyr::filter(tmr_pos %in% RA_tmrs)
+```    
+
+
+```{r phenograph_clustering_functions_for_discovr}
+# Clustering markers object is defined in the first set-up chunk.  Tweak which markers are included up there.
+
+# Set up Phenograph function to use kd tree
+find_neighbors <- function(data, k){
+  nearest <- RANN::nn2(data, data, k, treetype = "kd", searchtype = "standard")
+  return(nearest[[1]])
+}
+
+Rpheno <- function(data, k=30){
+  if(is.data.frame(data))
+    data <- as.matrix(data)
+
+  if(!is.matrix(data))
+    stop("Wrong input data, should be a data frame or matrix!")
+
+  if(k<1){
+    stop("k must be a positive integer!")
+  }else if (k > nrow(data)-2){
+    stop("k must be smaller than the total number of points!")
+  }
+
+  message("Run Rphenograph starts:","\n",
+          "  -Input data of ", nrow(data)," rows and ", ncol(data), " columns","\n",
+          "  -k is set to ", k)
+
+  cat("  Finding nearest neighbors...")
+  t1 <- system.time(neighborMatrix <- find_neighbors(data, k=k+1)[,-1])
+  cat("DONE ~",t1[3],"s\n", " Compute jaccard coefficient between nearest-neighbor sets...")
+  t2 <- system.time(links <- Rphenograph:::jaccard_coeff(neighborMatrix))
+
+  cat("DONE ~",t2[3],"s\n", " Build undirected graph from the weighted links...")
+  links <- links[links[,1]>0, ]
+  relations <- as.data.frame(links)
+  colnames(relations)<- c("from","to","weight")
+  t3 <- system.time(g <- igraph::graph.data.frame(relations, directed=FALSE))
+
+  cat("DONE ~",t3[3],"s\n", " Run louvain clustering on the graph ...")
+  t4 <- system.time(community <- igraph::cluster_louvain(g))
+  cat("DONE ~",t4[3],"s\n")
+
+  message("Run Rphenograph DONE, took a total of ", sum(c(t1[3],t2[3],t3[3],t4[3])), "s.")
+  cat("  Return a community class\n  -Modularity value:", igraph::modularity(community),"\n")
+  cat("  -Number of clusters:", length(unique(igraph::membership(community))),"\n")
+
+  return(community)
+}
+
+
+# Run phenograph (using kd treetype) on each subject.
+PhenographClust = function(fcs, clustering_markers) {
+  exprs_mat = as.matrix(as.data.frame(flowCore::exprs(fcs))[,clustering_markers])
+  RPvect = as.numeric(igraph::membership(Rpheno(data = exprs_mat)))
+  return(RPvect)
+}
+
+```
+
+```{r phenograph_clustering_and_cluster_calculations}
+# check for cached version of clustering results (for time and stochasticity)
+pheno_filename = file.path(dir_R_objects, "all_phenograph_data.RData")
+
+if (file.exists(pheno_filename)) {
+  load(pheno_filename)
+} else {
+  # run clustering and store it
+  mergedExpr$RPclust = unlist(lapply(all_tfm, PhenographClust, clustering_markers))
+  
+  # Get summary of the number of clusters generated for each subject
+  n_pheno_clusts <- mergedExpr %>%
+    group_by(sample) %>%
+    dplyr::summarize(k_clusters = max(RPclust))
+  # View(n_pheno_clusts) # 10 - 24 clusters per subject, mostly in the 16 - 19 range
+  
+  ## Calculate means by cluster
+  
+  # Calculate mean expression value of each marker for each phenograph cluster in each subject
+  RP_mean <- mergedExpr %>%
+    dplyr::select(-tmr_pos, -contains("tsne"), -contains("umap")) %>%
+    group_by(sample, RPclust) %>%
+    summarise_all(mean) %>%
+    mutate(RPclust = as.character(RPclust))
+  
+  # Calculate total CD8 mean expression for each subject
+  CD4_mean = mergedExpr %>%
+    dplyr::select(-tmr_pos, -RPclust) %>%
+    group_by(sample) %>%
+    summarise_all(mean) %>%
+    mutate(RPclust = "Total_CD4")
+  
+  RP_mean = bind_rows(RP_mean, CD4_mean)
+  
+  # Count cells of each specificity in each phenograph cluster (from each sample)
+  RPtmr_counting = mergedExpr %>% 
+    dplyr::select(sample, tmr_pos, RPclust) %>%
+    group_by(sample, RPclust) %>%
+    dplyr::summarise(
+      clust_size = n(), 
+      none = sum(tmr_pos=="none"), 
+      flu = sum(tmr_pos=="flu"),
+      agg = sum(tmr_pos=="agg"), 
+      cilp = sum(tmr_pos=="cilp"), 
+      eno = sum(tmr_pos=="eno"),
+      vf = sum(tmr_pos=="vf"))
+  
+  aggregate_counts = RPtmr_counting %>%
+    dplyr::select(-RPclust) %>%
+    group_by(sample) %>%
+    summarise_all(sum) %>%
+    rename_at(vars(-sample),function(name) paste0(name,"_tot"))
+  
+  RPtmr_counting = RPtmr_counting %>%
+    left_join(aggregate_counts) %>%
+    mutate(pct_nonspec_in_clust = none/none_tot * 100,
+           pct_flu_in_clust = flu/flu_tot * 100,
+           pct_agg_in_clust = agg/agg_tot * 100,
+           pct_cilp_in_clust = cilp/cilp_tot * 100,
+           pct_eno_in_clust = eno/eno_tot * 100,
+           pct_vf_in_clust = vf/vf_tot * 100)
+  
+  # Save the clustering output
+  save(mergedExpr, clustering_markers, RP_mean, RPtmr_counting, 
+       file = pheno_filename)
+}
+```
+
+
+```{r downsample_for_qa}
+# Check for donors with too many/too few collected events
+events_by_donor = mergedExpr %>%
+  group_by(sample) %>%
+  dplyr::summarise(n_events = n())
+hist(events_by_donor$n_events)
+
+# Make a df with the same total number of total CD4 events for each subject 
+all_events_ds <- mergedExpr %>% 
+  dplyr::filter(sample %in% events_by_donor$sample[events_by_donor$n_events > 4500],
+                tmr_pos == "none") %>%
+  group_by(sample) %>% 
+  sample_n(4500) %>%
+  bind_rows(mergedExpr %>% 
+              dplyr::filter(sample %in% events_by_donor$sample[events_by_donor$n_events > 4500],
+                            tmr_pos != "none"))
+
+# Make a separate downsampled version of all_tmf
+# Check for donors with too many/too few collected events
+
+# Downsample to a fixed amount of cells for faster processing/unbiased clustering
+ds_events = function(fcs) {
+  flowCore::exprs(fcs) = flowCore::exprs(fcs) %>%
+    .[sample(nrow(.), 4500, replace = F), ]
+  return(fcs)
+}
+
+ds_fs <- all_tfm %>%
+  .[events_by_donor$sample[events_by_donor$n_events > 4500]] %>%
+  map(ds_events) %>%
+  as("flowSet")
+```
+
+
+## QA, Density plots by sample
+Check marker density plots for each sample to look for any major batch effects.  Several markers look quite variable
+
+```{r density_plots_by_sample_qa, message=F, fig.width = 9, fig.height = 12}
+
+pdf(file = file.path(dir_density_plots, "density_by_sample.pdf"), width = 9, height = 12)
+flowViz::densityplot(
+  name~., ds_fs, channels=assay_markers, 
+  groups=name, main="Post-Transformation", 
+  scales=list(y=list(draw=T)), 
+  filter=lapply(assay_markers, curv1Filter),
+  layout=c(7,1))
+invisible(dev.off())
+```
+
